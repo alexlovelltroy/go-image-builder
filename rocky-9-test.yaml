@@ -1,0 +1,25 @@
+
+options:
+  layer_type: 'base'
+  name: 'rocky'
+  publish_tags: '9,latest'
+  pkg_manager: 'dnf'
+  parent: 'demo.openchami.cluster:5000/base/rocky:9'
+  registry_opts_pull:
+    - '--tls-verify=false'
+
+  # Publish SquashFS image to local S3
+  #publish_s3: 'http://demo.openchami.cluster:9000'
+  #s3_prefix: 'test/rocky/'
+  #s3_bucket: 'boot-images'
+
+  # Publish OCI image to container registry
+  #
+  # This is the only way to be able to re-use this image as
+  # a parent for another image layer.
+  publish_registry: 'demo.openchami.cluster:5000/test/'
+  registry_opts_push:
+    - '--tls-verify=false'
+
+cmds:
+  - cmd: 'echo "TEST" > /etc/motd'
