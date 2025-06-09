@@ -27,8 +27,10 @@ type OCIInterface interface {
 
 // OCI implements container image operations
 type OCI struct {
-	config  *imageconfig.Config
-	workDir string
+	config           *imageconfig.Config
+	workDir          string
+	parentContainer  string
+	parentMountPoint string
 }
 
 // NewOCI creates a new OCI instance
@@ -64,22 +66,42 @@ func (o *OCI) PullParentImage() error {
 	return nil
 }
 
-// MountParent mounts the parent image if specified
+// MountParent mounts the parent image
 func (o *OCI) MountParent() error {
-	// If no parent specified or parent is "scratch", skip mounting
-	if o.config.Options.Parent == "" || o.config.Options.Parent == "scratch" {
-		log.Printf("No parent image to mount, starting from scratch")
-		return nil
-	}
+	log.Infof("Mounting parent image: %s", o.config.Options.Parent)
 
-	log.Printf("Mounting parent image: %s", o.config.Options.Parent)
-
-	// Use buildah unshare for rootless mode
-	args := []string{"unshare", "buildah", "mount", o.config.Options.Parent}
+	// Create a new container from the parent image
+	args := []string{"from", o.config.Options.Parent}
 	cmd := exec.Command("buildah", args...)
-	if output, err := cmd.CombinedOutput(); err != nil {
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to create container from parent image: %w\nOutput: %s", err, string(output))
+	}
+	containerName := strings.TrimSpace(string(output))
+	log.Debugf("Created container from parent image: %s", containerName)
+
+	// Check if we're running as root
+	isRoot := os.Geteuid() == 0
+	log.Debugf("Running as root: %v", isRoot)
+
+	// Mount the container
+	var mountArgs []string
+	if isRoot {
+		mountArgs = []string{"mount", containerName}
+	} else {
+		mountArgs = []string{"unshare", "buildah", "mount", containerName}
+	}
+	cmd = exec.Command("buildah", mountArgs...)
+	output, err = cmd.CombinedOutput()
+	if err != nil {
 		return fmt.Errorf("failed to mount parent image: %w\nOutput: %s", err, string(output))
 	}
+	mountPoint := strings.TrimSpace(string(output))
+	log.Debugf("Parent image mounted at: %s", mountPoint)
+
+	// Store the container name for cleanup
+	o.parentContainer = containerName
+	o.parentMountPoint = mountPoint
 
 	return nil
 }
@@ -180,14 +202,67 @@ func (o *OCI) UnmountContainer(containerName string) error {
 	return nil
 }
 
+// cleanRegistryURL removes trailing slashes from registry URLs
+func (o *OCI) cleanRegistryURL(registry string) string {
+	cleaned := strings.TrimRight(registry, "/")
+	if cleaned != registry {
+		log.Debugf("Removed trailing slash from registry URL: %s -> %s", registry, cleaned)
+	}
+	return cleaned
+}
+
+// PushImage pushes the image to the registry
+func (o *OCI) PushImage() error {
+	registry := o.cleanRegistryURL(o.config.Options.PublishRegistry)
+	log.Infof("Pushing image to registry: %s", registry)
+
+	// Build the image reference
+	imageRef := o.config.Options.Name
+	if registry != "" {
+		imageRef = fmt.Sprintf("%s/%s", registry, imageRef)
+	}
+
+	// Add tags if specified
+	var tags []string
+	if o.config.Options.PublishTags != "" {
+		tags = strings.Split(o.config.Options.PublishTags, ",")
+	} else {
+		tags = []string{"latest"}
+	}
+
+	// Push each tag
+	for _, tag := range tags {
+		taggedRef := fmt.Sprintf("%s:%s", imageRef, tag)
+		log.Infof("Pushing image tag: %s", taggedRef)
+
+		// Build push command
+		args := []string{"push"}
+
+		// Add registry options
+		args = append(args, o.config.Options.RegistryOptsPush...)
+
+		// Add image reference
+		args = append(args, taggedRef)
+
+		cmd := exec.Command("buildah", args...)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to push image tag %s: %w\nOutput: %s", tag, err, string(output))
+		}
+	}
+
+	return nil
+}
+
 // CommitContainer commits the container as a new image
-func (o *OCI) CommitContainer(name string) error {
-	log.Infof("Committing container %s", name)
+func (o *OCI) CommitContainer(containerName, name string) error {
+	log.Infof("Committing container %s", containerName)
 
 	// Build the image reference
 	imageRef := name
 	if o.config.Options.PublishRegistry != "" {
-		imageRef = fmt.Sprintf("%s/%s", o.config.Options.PublishRegistry, name)
+		registry := o.cleanRegistryURL(o.config.Options.PublishRegistry)
+		imageRef = fmt.Sprintf("%s/%s", registry, name)
 	}
 
 	// Add tags if specified
@@ -201,7 +276,7 @@ func (o *OCI) CommitContainer(name string) error {
 	// Commit with each tag
 	for _, tag := range tags {
 		taggedRef := fmt.Sprintf("%s:%s", imageRef, tag)
-		args := []string{"commit", "working-container-1", taggedRef}
+		args := []string{"commit", containerName, taggedRef}
 
 		// Set environment to reduce buildah verbosity
 		cmd := exec.Command("buildah", args...)
@@ -252,53 +327,6 @@ func (o *OCI) getContainerInfo(containerName string) (*ContainerInfo, error) {
 	return info, nil
 }
 
-// PushImage pushes the image to the registry
-func (o *OCI) PushImage() error {
-	if o.config.Options.PublishRegistry == "" {
-		return nil
-	}
-
-	log.Infof("Pushing image to registry: %s", o.config.Options.PublishRegistry)
-
-	// Build image reference
-	imageRef := o.config.Options.Name
-	if o.config.Options.PublishRegistry != "" {
-		imageRef = fmt.Sprintf("%s/%s", o.config.Options.PublishRegistry, imageRef)
-	}
-
-	// Push each tag
-	tags := []string{"latest"}
-	if o.config.Options.PublishTags != "" {
-		tags = strings.Split(o.config.Options.PublishTags, ",")
-	}
-
-	for _, tag := range tags {
-		tag = strings.TrimSpace(tag)
-		if tag == "" {
-			continue
-		}
-
-		taggedRef := fmt.Sprintf("%s:%s", imageRef, tag)
-		log.Infof("Pushing image tag: %s", taggedRef)
-
-		// Build push command
-		args := []string{"push"}
-
-		// Add registry options
-		args = append(args, o.config.Options.RegistryOptsPush...)
-
-		// Add image reference and registry
-		args = append(args, taggedRef, o.config.Options.PublishRegistry)
-
-		cmd := exec.Command("buildah", args...)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to push image tag %s: %w\nOutput: %s", tag, err, string(output))
-		}
-	}
-
-	return nil
-}
-
 // Cleanup removes temporary containers and images
 func (o *OCI) Cleanup(containerName string) error {
 	log.Infof("Cleaning up container: %s", containerName)
@@ -310,4 +338,14 @@ func (o *OCI) Cleanup(containerName string) error {
 	}
 
 	return nil
+}
+
+// GetParentMountPoint returns the mount point of the parent image
+func (o *OCI) GetParentMountPoint() string {
+	return o.parentMountPoint
+}
+
+// GetParentContainer returns the name of the parent container
+func (o *OCI) GetParentContainer() string {
+	return o.parentContainer
 }

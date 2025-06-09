@@ -9,16 +9,19 @@ import (
 )
 
 var (
-	cfgFile  string
-	logLevel string
+	configFile     string
+	outputDir      string
+	logLevel       string
+	createSquashfs bool
+	createInitrd   bool
 )
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
 	Use:   "go-image-builder",
-	Short: "A tool for building system images",
-	Long: `A tool for building system images with support for multiple package managers
-and output formats.`,
+	Short: "A tool for building container images",
+	Long: `A tool for building container images with support for various package managers
+and customization options.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		// Set log level
 		level, err := log.ParseLevel(logLevel)
@@ -38,16 +41,29 @@ and output formats.`,
 
 // Execute adds all child commands to the root command and sets flags appropriately.
 func Execute() {
+	// Set up logging
+	log.SetOutput(os.Stdout)
+	log.SetFormatter(&log.TextFormatter{
+		FullTimestamp: true,
+	})
+
+	// Set log level
+	level, err := log.ParseLevel(logLevel)
+	if err != nil {
+		log.Fatalf("Invalid log level: %v", err)
+	}
+	log.SetLevel(level)
+
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		log.Fatal(err)
 	}
 }
 
 func init() {
-	// Here you will define your flags and configuration settings.
-	// Cobra supports persistent flags, which, if defined here,
-	// will be global for your application.
-	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.go-image-builder.yaml)")
-	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error, fatal)")
+	// Global flags
+	rootCmd.PersistentFlags().StringVarP(&configFile, "config", "c", "", "Path to the configuration file")
+	rootCmd.PersistentFlags().StringVarP(&outputDir, "output", "o", "", "Output directory for the build artifacts")
+	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "Log level (debug, info, warn, error, fatal)")
+	rootCmd.PersistentFlags().BoolVar(&createSquashfs, "create-squashfs", true, "Create a squashfs image")
+	rootCmd.PersistentFlags().BoolVar(&createInitrd, "create-initrd", true, "Create an initrd image")
 }

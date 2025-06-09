@@ -16,14 +16,16 @@ import (
 
 // Builder handles the image building process
 type Builder struct {
-	config *imageconfig.Config
-	rootfs string
-	pm     pkgmgr.PackageManager
-	oci    *oci.OCI
+	config               *imageconfig.Config
+	rootfs               string
+	pm                   pkgmgr.PackageManager
+	oci                  *oci.OCI
+	shouldCreateSquashfs bool
+	shouldCreateInitrd   bool
 }
 
 // NewBuilder creates a new Builder instance
-func NewBuilder(config *imageconfig.Config, workDir string) (*Builder, error) {
+func NewBuilder(config *imageconfig.Config, workDir string, createSquashfs, createInitrd bool) (*Builder, error) {
 	var pm pkgmgr.PackageManager
 	switch config.Options.PkgManager {
 	case "dnf":
@@ -39,10 +41,12 @@ func NewBuilder(config *imageconfig.Config, workDir string) (*Builder, error) {
 	}
 
 	return &Builder{
-		config: config,
-		rootfs: filepath.Join(workDir, "rootfs"),
-		pm:     pm,
-		oci:    oci.NewOCI(config, workDir),
+		config:               config,
+		rootfs:               filepath.Join(workDir, "rootfs"),
+		pm:                   pm,
+		oci:                  oci.NewOCI(config, workDir),
+		shouldCreateSquashfs: createSquashfs,
+		shouldCreateInitrd:   createInitrd,
 	}, nil
 }
 
@@ -50,6 +54,7 @@ func NewBuilder(config *imageconfig.Config, workDir string) (*Builder, error) {
 func (b *Builder) Build() error {
 	log.Info("Starting image build process")
 	var mountPoint string
+	var containerName string
 
 	// 1. Handle parent image or create new container
 	if b.config.Options.Parent != "" && b.config.Options.Parent != "scratch" {
@@ -63,10 +68,17 @@ func (b *Builder) Build() error {
 			return fmt.Errorf("failed to mount parent image: %w", err)
 		}
 		defer b.oci.UnmountParent()
+		mountPoint = b.oci.GetParentMountPoint()
+		if mountPoint == "" {
+			return fmt.Errorf("got empty mount point from parent image")
+		}
+		log.Debugf("Parent image mounted at: %s", mountPoint)
+		containerName = b.oci.GetParentContainer()
 	} else {
 		log.Info("Starting from scratch")
 		// Create and mount new container
-		containerName, err := b.oci.CreateContainer()
+		var err error
+		containerName, err = b.oci.CreateContainer()
 		if err != nil {
 			return fmt.Errorf("failed to create container: %w", err)
 		}
@@ -124,38 +136,46 @@ func (b *Builder) Build() error {
 		}
 	}
 
-	// 8. Generate initrd
-	log.Info("Generating initrd")
-	if err := b.generateInitrd(mountPoint); err != nil {
-		return fmt.Errorf("failed to generate initrd: %w", err)
+	// 8. Generate initrd if enabled
+	if b.shouldCreateInitrd {
+		log.Info("Generating initrd")
+		if err := b.generateInitrd(mountPoint); err != nil {
+			return fmt.Errorf("failed to generate initrd: %w", err)
+		}
+
+		// Extract kernel only if initrd is being created
+		log.Info("Extracting kernel")
+		if err := b.extractKernel(mountPoint); err != nil {
+			return fmt.Errorf("failed to extract kernel: %w", err)
+		}
+	} else {
+		log.Info("Skipping initrd generation and kernel extraction")
 	}
 
-	// 9. Create squashfs image
-	log.Info("Creating squashfs image")
-	if err := b.createSquashfs(mountPoint); err != nil {
-		return fmt.Errorf("failed to create squashfs: %w", err)
+	// 9. Create squashfs image if enabled
+	if b.shouldCreateSquashfs {
+		log.Info("Creating squashfs image")
+		if err := b.createSquashfs(mountPoint); err != nil {
+			return fmt.Errorf("failed to create squashfs: %w", err)
+		}
+	} else {
+		log.Info("Skipping squashfs creation")
 	}
 
-	// 10. Extract kernel
-	log.Info("Extracting kernel")
-	if err := b.extractKernel(mountPoint); err != nil {
-		return fmt.Errorf("failed to extract kernel: %w", err)
-	}
-
-	// 11. Commit container as new image
+	// 10. Commit container as new image
 	log.Info("Committing container as new image")
 	log.Debugf("Committing as: %s", b.config.Options.Name)
-	if err := b.oci.CommitContainer(b.config.Options.Name); err != nil {
+	if err := b.oci.CommitContainer(containerName, b.config.Options.Name); err != nil {
 		return fmt.Errorf("failed to commit container: %w", err)
 	}
 
-	// 12. Cleanup
+	// 11. Cleanup
 	log.Info("Cleaning up")
 	if err := b.pm.Cleanup(mountPoint); err != nil {
 		return fmt.Errorf("failed to cleanup: %w", err)
 	}
 
-	// 13. Push image to registry if specified
+	// 12. Push image to registry if specified
 	if b.config.Options.PublishRegistry != "" {
 		log.Info("Pushing image to registry")
 		log.Debugf("Pushing to registry: %s", b.config.Options.PublishRegistry)
