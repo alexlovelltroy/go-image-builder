@@ -51,6 +51,32 @@ func (o *OCI) PullParentImage() error {
 
 	log.Printf("Pulling parent image: %s", o.config.Options.Parent)
 
+	// Clean up any existing containers first
+	cleanupArgs := []string{"containers", "--format", "{{.ContainerID}}"}
+	cmd := exec.Command("buildah", cleanupArgs...)
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		containers := strings.Split(strings.TrimSpace(string(output)), "\n")
+		for _, container := range containers {
+			if container == "" {
+				continue
+			}
+			log.Debugf("Cleaning up stale container: %s", container)
+			cleanupCmd := exec.Command("buildah", "rm", container)
+			cleanupCmd.Run() // Ignore errors during cleanup
+		}
+	}
+
+	// Remove the image if it exists
+	rmiArgs := []string{"rmi", o.config.Options.Parent}
+	cmd = exec.Command("buildah", rmiArgs...)
+	cmd.Run() // Ignore errors, as the image might not exist
+
+	// Clean up any dangling images
+	pruneArgs := []string{"prune", "-f"}
+	cmd = exec.Command("buildah", pruneArgs...)
+	cmd.Run() // Ignore errors during cleanup
+
 	// Build pull command
 	args := []string{"pull"}
 	if o.config.Options.PublishRegistry != "" {
@@ -58,11 +84,40 @@ func (o *OCI) PullParentImage() error {
 	}
 	args = append(args, o.config.Options.Parent)
 
-	cmd := exec.Command("buildah", args...)
+	cmd = exec.Command("buildah", args...)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to pull parent image: %w\nOutput: %s", err, string(output))
 	}
 
+	// Verify the image exists and is accessible
+	verifyArgs := []string{"images", "--format", "{{.Name}}:{{.Tag}}"}
+	cmd = exec.Command("buildah", verifyArgs...)
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to verify image pull: %w", err)
+	}
+
+	images := strings.Split(strings.TrimSpace(string(output)), "\n")
+	imageFound := false
+	for _, image := range images {
+		if image == o.config.Options.Parent {
+			imageFound = true
+			break
+		}
+	}
+
+	if !imageFound {
+		return fmt.Errorf("parent image %s not found after pull", o.config.Options.Parent)
+	}
+
+	// Verify the image is accessible by trying to inspect it
+	inspectArgs := []string{"inspect", o.config.Options.Parent}
+	cmd = exec.Command("buildah", inspectArgs...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to inspect parent image: %w\nOutput: %s", err, string(output))
+	}
+
+	log.Debugf("Successfully verified parent image: %s", o.config.Options.Parent)
 	return nil
 }
 
@@ -70,19 +125,40 @@ func (o *OCI) PullParentImage() error {
 func (o *OCI) MountParent() error {
 	log.Infof("Mounting parent image: %s", o.config.Options.Parent)
 
-	// Create a new container from the parent image
-	args := []string{"from", o.config.Options.Parent}
-	cmd := exec.Command("buildah", args...)
+	// Check if we're running as root
+	isRoot := os.Geteuid() == 0
+	log.Debugf("Running as root: %v", isRoot)
+
+	// Clean up any existing containers first
+	cleanupArgs := []string{"containers", "--format", "{{.ContainerID}}"}
+	cmd := exec.Command("buildah", cleanupArgs...)
 	output, err := cmd.CombinedOutput()
+	if err == nil {
+		containers := strings.Split(strings.TrimSpace(string(output)), "\n")
+		for _, container := range containers {
+			if container == "" {
+				continue
+			}
+			log.Debugf("Cleaning up stale container: %s", container)
+			cleanupCmd := exec.Command("buildah", "rm", container)
+			cleanupCmd.Run() // Ignore errors during cleanup
+		}
+	}
+
+	// Create a new container from the parent image
+	var fromArgs []string
+	if isRoot {
+		fromArgs = []string{"from", "--pull=never", o.config.Options.Parent}
+	} else {
+		fromArgs = []string{"unshare", "buildah", "from", "--pull=never", o.config.Options.Parent}
+	}
+	cmd = exec.Command("buildah", fromArgs...)
+	output, err = cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("failed to create container from parent image: %w\nOutput: %s", err, string(output))
 	}
 	containerName := strings.TrimSpace(string(output))
 	log.Debugf("Created container from parent image: %s", containerName)
-
-	// Check if we're running as root
-	isRoot := os.Geteuid() == 0
-	log.Debugf("Running as root: %v", isRoot)
 
 	// Mount the container
 	var mountArgs []string
@@ -94,6 +170,9 @@ func (o *OCI) MountParent() error {
 	cmd = exec.Command("buildah", mountArgs...)
 	output, err = cmd.CombinedOutput()
 	if err != nil {
+		// Clean up the container if mount fails
+		cleanupCmd := exec.Command("buildah", "rm", containerName)
+		cleanupCmd.Run() // Ignore errors during cleanup
 		return fmt.Errorf("failed to mount parent image: %w\nOutput: %s", err, string(output))
 	}
 	mountPoint := strings.TrimSpace(string(output))
@@ -115,8 +194,17 @@ func (o *OCI) UnmountParent() error {
 
 	log.Printf("Unmounting parent image: %s", o.config.Options.Parent)
 
+	// Check if we're running as root
+	isRoot := os.Geteuid() == 0
+	log.Debugf("Running as root: %v", isRoot)
+
 	// Use buildah unshare for rootless mode
-	args := []string{"unshare", "buildah", "umount", o.config.Options.Parent}
+	var args []string
+	if isRoot {
+		args = []string{"umount", o.parentContainer}
+	} else {
+		args = []string{"unshare", "buildah", "umount", o.parentContainer}
+	}
 	cmd := exec.Command("buildah", args...)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to unmount parent image: %w\nOutput: %s", err, string(output))
@@ -202,25 +290,40 @@ func (o *OCI) UnmountContainer(containerName string) error {
 	return nil
 }
 
-// cleanRegistryURL removes trailing slashes from registry URLs
+// cleanRegistryURL removes any trailing slashes from the registry URL
 func (o *OCI) cleanRegistryURL(registry string) string {
-	cleaned := strings.TrimRight(registry, "/")
-	if cleaned != registry {
-		log.Debugf("Removed trailing slash from registry URL: %s -> %s", registry, cleaned)
-	}
-	return cleaned
+	return strings.TrimRight(registry, "/")
+}
+
+// cleanImagePath removes any double slashes and ensures proper path formatting
+func (o *OCI) cleanImagePath(path string) string {
+	// Remove any double slashes
+	path = strings.ReplaceAll(path, "//", "/")
+	// Remove trailing slash
+	path = strings.TrimRight(path, "/")
+	return path
 }
 
 // PushImage pushes the image to the registry
 func (o *OCI) PushImage() error {
-	registry := o.cleanRegistryURL(o.config.Options.PublishRegistry)
-	log.Infof("Pushing image to registry: %s", registry)
+	log.Printf("Pushing image to registry")
 
-	// Build the image reference
-	imageRef := o.config.Options.Name
-	if registry != "" {
-		imageRef = fmt.Sprintf("%s/%s", registry, imageRef)
+	// Clean up registry URL and image path
+	registry := o.cleanRegistryURL(o.config.Options.PublishRegistry)
+	imageName := o.cleanImagePath(o.config.Options.Name)
+
+	log.Debugf("Pushing to registry: %s", registry)
+
+	// Build the full image name
+	imgName := fmt.Sprintf("%s/%s", registry, imageName)
+	log.Debugf("Starting image push to registry: %s", imgName)
+
+	// Configure registry options
+	var args []string
+	if o.config.Options.RegistryOptsPush != nil {
+		args = append(args, o.config.Options.RegistryOptsPush...)
 	}
+	log.Debugf("Configuring registry options with insecure flag")
 
 	// Add tags if specified
 	var tags []string
@@ -230,24 +333,54 @@ func (o *OCI) PushImage() error {
 		tags = []string{"latest"}
 	}
 
-	// Push each tag
+	// Push each tag with retries
+	maxRetries := 3
+	var lastErr error
 	for _, tag := range tags {
-		taggedRef := fmt.Sprintf("%s:%s", imageRef, tag)
-		log.Infof("Pushing image tag: %s", taggedRef)
+		taggedRef := fmt.Sprintf("%s:%s", imgName, tag)
+		log.Debugf("Pushing image with tag: %s", tag)
 
-		// Build push command
-		args := []string{"push"}
+		for i := 0; i < maxRetries; i++ {
+			if i > 0 {
+				log.Debugf("Retrying push (attempt %d/%d)", i+1, maxRetries)
+				time.Sleep(time.Second * time.Duration(i+1)) // Exponential backoff
+			}
 
-		// Add registry options
-		args = append(args, o.config.Options.RegistryOptsPush...)
+			// Build push command
+			pushArgs := append([]string{"push"}, args...)
+			pushArgs = append(pushArgs, taggedRef)
 
-		// Add image reference
-		args = append(args, taggedRef)
+			cmd := exec.Command("buildah", pushArgs...)
+			output, err := cmd.CombinedOutput()
+			if err == nil {
+				log.Debugf("Successfully pushed image to registry")
+				break
+			}
 
-		cmd := exec.Command("buildah", args...)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("failed to push image tag %s: %w\nOutput: %s", tag, err, string(output))
+			lastErr = fmt.Errorf("failed to push image with tag %s: %w\nOutput: %s", tag, err, string(output))
+			log.Warnf("Push attempt %d failed: %v", i+1, lastErr)
+
+			// Check if we should retry based on the error
+			if strings.Contains(err.Error(), "BLOB_UPLOAD_UNKNOWN") {
+				// Try to clean up any stale uploads
+				cleanupArgs := []string{"rmi", taggedRef}
+				cleanupCmd := exec.Command("buildah", cleanupArgs...)
+				cleanupCmd.Run() // Ignore errors during cleanup
+
+				// Try to clean up the registry's upload directory
+				if i == maxRetries-1 {
+					log.Warnf("All retry attempts failed. Please check registry configuration and storage.")
+					log.Warnf("You may need to clean up the registry's upload directory manually.")
+				}
+				continue
+			}
+
+			// For other errors, don't retry
+			break
+		}
+
+		if lastErr != nil {
+			return fmt.Errorf("failed to push image after %d attempts: %w", maxRetries, lastErr)
 		}
 	}
 

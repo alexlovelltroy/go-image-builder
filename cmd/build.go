@@ -82,7 +82,7 @@ func init() {
 	buildCmd.Flags().StringP("config", "c", "", "Path to the configuration file (required)")
 	buildCmd.Flags().StringP("output", "o", "", "Output directory")
 	buildCmd.Flags().BoolP("squashfs", "s", false, "Create a squashfs image")
-	buildCmd.Flags().BoolP("initrd", "i", false, "Create an initrd image")
+	buildCmd.Flags().BoolP("initrd", "i", true, "Create an initrd image (default: true)")
 
 	// Mark required flags
 	buildCmd.MarkFlagRequired("config")

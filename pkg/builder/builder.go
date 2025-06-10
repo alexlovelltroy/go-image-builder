@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"go-image-builder/internal/pkgmgr"
+	"go-image-builder/pkg/image"
 	"go-image-builder/pkg/imageconfig"
 	"go-image-builder/pkg/oci"
 
@@ -162,26 +163,73 @@ func (b *Builder) Build() error {
 		log.Info("Skipping squashfs creation")
 	}
 
-	// 10. Commit container as new image
-	log.Info("Committing container as new image")
-	log.Debugf("Committing as: %s", b.config.Options.Name)
-	if err := b.oci.CommitContainer(containerName, b.config.Options.Name); err != nil {
-		return fmt.Errorf("failed to commit container: %w", err)
+	// 10. Create image with layers
+	log.Info("Creating image with layers")
+	img, err := image.NewImage(b.config.Options.PublishRegistry, b.config.Options.Name, b.config)
+	if err != nil {
+		return fmt.Errorf("failed to create image: %w", err)
 	}
 
-	// 11. Cleanup
-	log.Info("Cleaning up")
-	if err := b.pm.Cleanup(mountPoint); err != nil {
-		return fmt.Errorf("failed to cleanup: %w", err)
+	// Add base layer
+	err = img.AddBaseLayer(mountPoint)
+	if err != nil {
+		return fmt.Errorf("failed to add base layer: %w", err)
 	}
 
-	// 12. Push image to registry if specified
+	// Add config layer
+	if err := img.AddConfigLayer(); err != nil {
+		return fmt.Errorf("failed to add config layer: %w", err)
+	}
+
+	// Add kernel and initrd layers if they were created
+	if b.shouldCreateInitrd {
+		// Get kernel version
+		kernelVersion, err := getKernelVersion(mountPoint)
+		if err != nil {
+			return fmt.Errorf("failed to get kernel version: %w", err)
+		}
+
+		// Copy kernel from container
+		kernelPath := filepath.Join(b.rootfs, "..", "kernel")
+		if err := copyFile(filepath.Join(mountPoint, "lib/modules", kernelVersion, "vmlinuz"), kernelPath); err != nil {
+			return fmt.Errorf("failed to copy kernel: %w", err)
+		}
+
+		// Find initrd file
+		initrdPath := filepath.Join(mountPoint, "boot", fmt.Sprintf("initramfs-%s.img", kernelVersion))
+		if _, err := os.Stat(initrdPath); os.IsNotExist(err) {
+			// Try alternative name
+			initrdPath = filepath.Join(mountPoint, "boot", "initrd.img")
+			if _, err := os.Stat(initrdPath); os.IsNotExist(err) {
+				return fmt.Errorf("failed to find initrd file: %w", err)
+			}
+		}
+
+		// Add kernel and initrd layers
+		if err := img.AddKernelLayer(kernelPath, kernelVersion); err != nil {
+			return fmt.Errorf("failed to add kernel layer: %w", err)
+		}
+		if err := img.AddInitrdLayer(initrdPath); err != nil {
+			return fmt.Errorf("failed to add initrd layer: %w", err)
+		}
+	}
+
+	// 11. Push image to registry if specified
 	if b.config.Options.PublishRegistry != "" {
 		log.Info("Pushing image to registry")
 		log.Debugf("Pushing to registry: %s", b.config.Options.PublishRegistry)
-		if err := b.oci.PushImage(); err != nil {
+		if err := img.Push(); err != nil {
 			return fmt.Errorf("failed to push image: %w", err)
 		}
+	}
+
+	// Clean up temporary directories
+	img.Cleanup()
+
+	// 12. Cleanup
+	log.Info("Cleaning up")
+	if err := b.pm.Cleanup(mountPoint); err != nil {
+		return fmt.Errorf("failed to cleanup: %w", err)
 	}
 
 	log.Info("Image build completed successfully")
@@ -288,5 +336,41 @@ func (b *Builder) getKernelVersion(rootfs string) (string, error) {
 	}
 
 	// Use the first kernel version found
+	return entries[0].Name(), nil
+}
+
+func copyFile(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("failed to open source file: %w", err)
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		return fmt.Errorf("failed to create destination file: %w", err)
+	}
+	defer dstFile.Close()
+
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		return fmt.Errorf("failed to copy file: %w", err)
+	}
+
+	return nil
+}
+
+// getKernelVersion returns the kernel version from the container
+func getKernelVersion(mountPoint string) (string, error) {
+	// List the contents of /lib/modules
+	entries, err := os.ReadDir(filepath.Join(mountPoint, "lib/modules"))
+	if err != nil {
+		return "", fmt.Errorf("failed to read /lib/modules: %w", err)
+	}
+
+	// Get the first entry (should be the kernel version)
+	if len(entries) == 0 {
+		return "", fmt.Errorf("no kernel modules found")
+	}
+
 	return entries[0].Name(), nil
 }

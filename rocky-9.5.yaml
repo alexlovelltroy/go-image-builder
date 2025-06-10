@@ -29,8 +29,3 @@ packages:
   - rsyslog
   - sudo
 
-cmds:
-  - cmd: 'dracut --add "dmsquash-live livenet network-manager" --kver $(basename /lib/modules/*) -N -f --logfile /tmp/dracut.log 2>/dev/null'
-    loglevel: INFO
-  - cmd: 'echo DRACUT LOG:; cat /tmp/dracut.log'
-    loglevel: INFO

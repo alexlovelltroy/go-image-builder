@@ -146,3 +146,19 @@ func LoadConfig(path string) (*Config, error) {
 
 	return &config, nil
 }
+
+// WriteConfig writes a configuration to a YAML file
+func WriteConfig(config *Config, path string) error {
+	// Marshal the configuration to YAML
+	data, err := yaml.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	// Write the configuration to the file
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return fmt.Errorf("failed to write config file: %w", err)
+	}
+
+	return nil
+}

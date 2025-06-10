@@ -1,7 +1,7 @@
 options:
   layer_type: 'base'
   name: 'rocky'
-  publish_tags: '9,latest'
+  publish_tags: '9,latest,foo,bar,baz'
   pkg_manager: 'dnf'
   parent: 'scratch'
   publish_registry: 'demo.openchami.cluster:5000/base'
