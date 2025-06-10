@@ -30,30 +30,6 @@ type Image struct {
 	tempDirs []string // Track temporary directories for cleanup
 }
 
-// detectOSFromRootfs reads /etc/os-release from the rootfs to determine the OS
-func detectOSFromRootfs(rootfs string) (string, error) {
-	osReleasePath := filepath.Join(rootfs, "etc", "os-release")
-	if _, err := os.Stat(osReleasePath); os.IsNotExist(err) {
-		return "linux", nil // Default to linux if os-release doesn't exist
-	}
-
-	content, err := os.ReadFile(osReleasePath)
-	if err != nil {
-		return "linux", fmt.Errorf("failed to read os-release: %w", err)
-	}
-
-	// Parse os-release content
-	lines := strings.Split(string(content), "\n")
-	for _, line := range lines {
-		if strings.HasPrefix(line, "ID=") {
-			os := strings.Trim(strings.TrimPrefix(line, "ID="), "\"")
-			return os, nil
-		}
-	}
-
-	return "linux", nil // Default to linux if ID not found
-}
-
 // NewImage creates a new image with the given registry and name
 func NewImage(registry, imgname string, cfg *imageconfig.Config) (*Image, error) {
 	log.Debugf("Creating new image for registry: %s, name: %s", registry, imgname)

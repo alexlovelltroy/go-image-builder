@@ -184,7 +184,7 @@ func (b *Builder) Build() error {
 	// Add kernel and initrd layers if they were created
 	if b.shouldCreateInitrd {
 		// Get kernel version
-		kernelVersion, err := getKernelVersion(mountPoint)
+		kernelVersion, err := b.getKernelVersion(mountPoint)
 		if err != nil {
 			return fmt.Errorf("failed to get kernel version: %w", err)
 		}
@@ -340,37 +340,21 @@ func (b *Builder) getKernelVersion(rootfs string) (string, error) {
 }
 
 func copyFile(src, dst string) error {
-	srcFile, err := os.Open(src)
+	in, err := os.Open(src)
 	if err != nil {
 		return fmt.Errorf("failed to open source file: %w", err)
 	}
-	defer srcFile.Close()
+	defer in.Close()
 
-	dstFile, err := os.Create(dst)
+	out, err := os.Create(dst)
 	if err != nil {
 		return fmt.Errorf("failed to create destination file: %w", err)
 	}
-	defer dstFile.Close()
+	defer out.Close()
 
-	if _, err := io.Copy(dstFile, srcFile); err != nil {
-		return fmt.Errorf("failed to copy file: %w", err)
+	if _, err := io.Copy(out, in); err != nil {
+		return fmt.Errorf("failed to copy file contents: %w", err)
 	}
 
-	return nil
-}
-
-// getKernelVersion returns the kernel version from the container
-func getKernelVersion(mountPoint string) (string, error) {
-	// List the contents of /lib/modules
-	entries, err := os.ReadDir(filepath.Join(mountPoint, "lib/modules"))
-	if err != nil {
-		return "", fmt.Errorf("failed to read /lib/modules: %w", err)
-	}
-
-	// Get the first entry (should be the kernel version)
-	if len(entries) == 0 {
-		return "", fmt.Errorf("no kernel modules found")
-	}
-
-	return entries[0].Name(), nil
+	return out.Sync()
 }

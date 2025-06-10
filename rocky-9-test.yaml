@@ -9,9 +9,9 @@ options:
     - '--tls-verify=false'
 
   # Publish SquashFS image to local S3
-  #publish_s3: 'http://demo.openchami.cluster:9000'
-  #s3_prefix: 'test/rocky/'
-  #s3_bucket: 'boot-images'
+  publish_s3: 'http://demo.openchami.cluster:9000'
+  s3_prefix: 'test/rocky/'
+  s3_bucket: 'boot-images'
 
   # Publish OCI image to container registry
   #
