@@ -333,6 +333,17 @@ func (o *OCI) PushImage() error {
 		tags = []string{"latest"}
 	}
 
+	// If we have a parent image, try to push it first
+	if o.config.Options.Parent != "" && o.config.Options.Parent != "scratch" {
+		log.Debugf("Pushing parent image first: %s", o.config.Options.Parent)
+		parentArgs := append([]string{"push"}, args...)
+		parentArgs = append(parentArgs, o.config.Options.Parent)
+		cmd := exec.Command("buildah", parentArgs...)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			log.Warnf("Failed to push parent image (this is expected if it already exists): %v\nOutput: %s", err, string(output))
+		}
+	}
+
 	// Push each tag with retries
 	maxRetries := 3
 	var lastErr error
@@ -346,8 +357,13 @@ func (o *OCI) PushImage() error {
 				time.Sleep(time.Second * time.Duration(i+1)) // Exponential backoff
 			}
 
-			// Build push command
+			// Build push command with additional options for parent images
 			pushArgs := append([]string{"push"}, args...)
+			if o.config.Options.Parent != "" && o.config.Options.Parent != "scratch" {
+				// Add options to handle parent image layers
+				pushArgs = append(pushArgs, "--format", "oci")
+				pushArgs = append(pushArgs, "--disable-compression")
+			}
 			pushArgs = append(pushArgs, taggedRef)
 
 			cmd := exec.Command("buildah", pushArgs...)
@@ -371,6 +387,7 @@ func (o *OCI) PushImage() error {
 				if i == maxRetries-1 {
 					log.Warnf("All retry attempts failed. Please check registry configuration and storage.")
 					log.Warnf("You may need to clean up the registry's upload directory manually.")
+					log.Warnf("If using a parent image, ensure it exists in the registry and is accessible.")
 				}
 				continue
 			}

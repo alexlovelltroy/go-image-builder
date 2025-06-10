@@ -41,19 +41,6 @@ and customization options.`,
 
 // Execute adds all child commands to the root command and sets flags appropriately.
 func Execute() {
-	// Set up logging
-	log.SetOutput(os.Stdout)
-	log.SetFormatter(&log.TextFormatter{
-		FullTimestamp: true,
-	})
-
-	// Set log level
-	level, err := log.ParseLevel(logLevel)
-	if err != nil {
-		log.Fatalf("Invalid log level: %v", err)
-	}
-	log.SetLevel(level)
-
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatal(err)
 	}

@@ -3,6 +3,7 @@ package image
 import (
 	"fmt"
 	"go-image-builder/pkg/imageconfig"
+	"go-image-builder/pkg/utils"
 	"io"
 	"os"
 	"os/exec"
@@ -57,20 +58,40 @@ func detectOSFromRootfs(rootfs string) (string, error) {
 func NewImage(registry, imgname string, cfg *imageconfig.Config) (*Image, error) {
 	log.Debugf("Creating new image for registry: %s, name: %s", registry, imgname)
 
-	// Ensure we have a full registry path
-	fullName := imgname
-	if registry != "" {
-		fullName = fmt.Sprintf("%s/%s", registry, imgname)
-	}
+	// Sanitize registry and image name
+	registry = utils.SanitizeRegistryURL(registry)
+	imgname = utils.SanitizeImagePath(imgname)
 
-	// Create a new empty image
-	img, err := mutate.ConfigFile(empty.Image, &v1.ConfigFile{
-		Architecture: "amd64",
-		OS:           "linux",
-		Created:      v1.Time{Time: time.Now().UTC()},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create empty image: %w", err)
+	// Build the full image name
+	fullName := utils.BuildImageReference(registry, imgname)
+	log.Debugf("Full image name: %s", fullName)
+
+	var img v1.Image
+	var err error
+
+	if cfg.Options.Parent != "" && cfg.Options.Parent != "scratch" {
+		log.Debugf("Using parent image: %s", cfg.Options.Parent)
+		// Pull and use parent image
+		ref, err := name.ParseReference(cfg.Options.Parent, name.Insecure)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse parent image reference: %w", err)
+		}
+		img, err = crane.Pull(ref.String(), crane.Insecure)
+		if err != nil {
+			return nil, fmt.Errorf("failed to pull parent image: %w", err)
+		}
+		log.Debugf("Successfully pulled parent image")
+	} else {
+		log.Debug("Creating new empty image")
+		// Create empty image
+		img, err = mutate.ConfigFile(empty.Image, &v1.ConfigFile{
+			Architecture: "amd64",
+			OS:           "linux",
+			Created:      v1.Time{Time: time.Now().UTC()},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create empty image: %w", err)
+		}
 	}
 
 	return &Image{
@@ -155,8 +176,17 @@ func (i *Image) AddBaseLayer(path string) error {
 	if config.Config.Labels == nil {
 		config.Config.Labels = make(map[string]string)
 	}
+
 	// Add parent image information
-	config.Config.Labels["com.openchami.image.parent"] = i.config.Options.Parent
+	if i.config.Options.Parent != "" && i.config.Options.Parent != "scratch" {
+		config.Config.Labels["com.openchami.image.parent"] = i.config.Options.Parent
+		// Get parent image layers
+		parentLayers, err := i.img.Layers()
+		if err != nil {
+			return fmt.Errorf("failed to get parent layers: %w", err)
+		}
+		log.Debugf("Parent image has %d layers", len(parentLayers))
+	}
 
 	// Add OS information
 	config.Config.Labels["com.openchami.image.os.name"] = osInfo["NAME"]
@@ -478,9 +508,20 @@ func (i *Image) Push() error {
 	log.Debugf("Starting image push to registry: %s", i.name)
 
 	// Configure registry options
-	log.Debug("Configuring registry options with insecure flag")
+	log.Debug("Configuring registry options")
 	opts := []crane.Option{
 		crane.Insecure,
+	}
+
+	// Add registry options from config if specified
+	if i.config.Options.RegistryOptsPush != nil {
+		log.Debugf("Adding registry options: %v", i.config.Options.RegistryOptsPush)
+		for _, opt := range i.config.Options.RegistryOptsPush {
+			if opt == "--tls-verify=false" {
+				opts = append(opts, crane.Insecure)
+				log.Debug("Added insecure option for TLS verification")
+			}
+		}
 	}
 
 	// Get the base image reference
@@ -489,14 +530,18 @@ func (i *Image) Push() error {
 	if err != nil {
 		return fmt.Errorf("failed to parse image reference: %w", err)
 	}
+	log.Debugf("Parsed image reference: %s", baseRef.String())
 
-	// Verify the image exists
-	log.Debug("Verifying image exists")
+	// Verify the image exists and get its manifest
+	log.Debug("Verifying image exists and getting manifest")
 	manifest, err := i.img.Manifest()
 	if err != nil {
 		return fmt.Errorf("failed to get image manifest: %w", err)
 	}
 	log.Debugf("Image manifest verified with %d layers", len(manifest.Layers))
+	for i, layer := range manifest.Layers {
+		log.Debugf("Layer %d: Size=%d, Digest=%s", i, layer.Size, layer.Digest)
+	}
 
 	// Parse publish tags
 	tags := strings.Split(i.config.Options.PublishTags, ",")
@@ -504,6 +549,7 @@ func (i *Image) Push() error {
 		// If no tags specified, use the default tag
 		tags = []string{baseRef.Identifier()}
 	}
+	log.Debugf("Publishing with tags: %v", tags)
 
 	// Push the image with each tag
 	for _, tag := range tags {
@@ -517,10 +563,66 @@ func (i *Image) Push() error {
 		if err != nil {
 			return fmt.Errorf("failed to create tag reference: %w", err)
 		}
+		log.Debugf("Created tag reference: %s", taggedRef.String())
 
-		log.Debugf("Pushing image with tag: %s", tag)
-		if err := crane.Push(i.img, taggedRef.String(), opts...); err != nil {
-			return fmt.Errorf("failed to push image with tag %s: %w", tag, err)
+		// If we have a parent image, ensure it's pushed first
+		if i.config.Options.Parent != "" && i.config.Options.Parent != "scratch" {
+			parentRefStr := utils.SanitizeRegistryURL(i.config.Options.Parent)
+			log.Debugf("Ensuring parent image is pushed: %s", parentRefStr)
+			parentRef, err := name.ParseReference(parentRefStr, name.Insecure)
+			if err != nil {
+				return fmt.Errorf("failed to parse parent image reference: %w", err)
+			}
+
+			// Try to pull the parent image first to ensure it exists
+			log.Debugf("Attempting to pull parent image: %s", parentRef.String())
+			_, err = crane.Pull(parentRef.String(), opts...)
+			if err != nil {
+				log.Warnf("Failed to pull parent image (this is expected if it doesn't exist): %v", err)
+			} else {
+				log.Debugf("Successfully pulled parent image: %s", parentRef.String())
+			}
+
+			// Try to push the parent image first
+			log.Debugf("Attempting to push parent image: %s", parentRef.String())
+			if err := crane.Push(i.img, parentRef.String(), opts...); err != nil {
+				log.Warnf("Failed to push parent image (this is expected if it already exists): %v", err)
+			} else {
+				log.Debugf("Successfully pushed parent image: %s", parentRef.String())
+			}
+		}
+
+		// Push the image with retries
+		maxRetries := 3
+		var lastErr error
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			if attempt > 0 {
+				log.Debugf("Retrying push (attempt %d/%d)", attempt+1, maxRetries)
+				time.Sleep(time.Second * time.Duration(attempt+1)) // Exponential backoff
+			}
+
+			log.Debugf("Pushing image with tag: %s (attempt %d)", tag, attempt+1)
+			if err := crane.Push(i.img, taggedRef.String(), opts...); err != nil {
+				lastErr = err
+				log.Warnf("Push attempt %d failed: %v", attempt+1, err)
+
+				// Check if we should retry based on the error
+				if strings.Contains(err.Error(), "BLOB_UPLOAD_UNKNOWN") {
+					log.Debug("BLOB_UPLOAD_UNKNOWN error detected, will retry")
+					continue
+				}
+
+				// For other errors, don't retry
+				break
+			}
+
+			log.Debugf("Successfully pushed image with tag: %s", tag)
+			lastErr = nil
+			break
+		}
+
+		if lastErr != nil {
+			return fmt.Errorf("failed to push image with tag %s after %d attempts: %w", tag, maxRetries, lastErr)
 		}
 	}
 
