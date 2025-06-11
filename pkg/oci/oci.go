@@ -1,6 +1,7 @@
 package oci
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -67,18 +68,27 @@ func (o *OCI) executeBuildah(args ...string) ([]byte, error) {
 
 // PullParentImage pulls the parent image if specified
 func (o *OCI) PullParentImage() error {
-	// If no parent specified or parent is "scratch", skip pulling
 	if o.config.Options.Parent == "" || o.config.Options.Parent == "scratch" {
 		log.Info("No parent image specified, starting from scratch")
 		return nil
 	}
 
-	log.Infof("Pulling parent image: %s", o.config.Options.Parent)
+	parentImage := o.config.Options.Parent
+	log.Infof("Checking for local parent image: %s", parentImage)
 
-	// Clean up any existing containers first
+	// 1. Check if image exists locally using 'buildah inspect'.
+	inspectArgs := []string{"inspect", "--type=image", parentImage}
+	if _, err := o.executeBuildah(inspectArgs...); err == nil {
+		log.Infof("Parent image '%s' found locally, using it.", parentImage)
+		log.Debug("Note: To force a refresh, remove the local image manually before running.")
+		return nil
+	}
+
+	log.Infof("Parent image '%s' not found locally. Pulling from registry...", parentImage)
+
+	// Clean up any existing containers first. This is good practice.
 	cleanupArgs := []string{"containers", "--format", "{{.ContainerID}}"}
-	output, err := o.executeBuildah(cleanupArgs...)
-	if err == nil {
+	if output, err := o.executeBuildah(cleanupArgs...); err == nil {
 		containers := strings.Split(strings.TrimSpace(string(output)), "\n")
 		for _, container := range containers {
 			if container == "" {
@@ -89,52 +99,27 @@ func (o *OCI) PullParentImage() error {
 		}
 	}
 
-	// Remove the image if it exists
-	rmiArgs := []string{"rmi", o.config.Options.Parent}
-	o.executeBuildah(rmiArgs...) // Ignore errors, as the image might not exist
+	// Clean up any dangling images to save space.
+	o.executeBuildah("prune", "-f") // Ignore errors during cleanup
 
-	// Clean up any dangling images
-	pruneArgs := []string{"prune", "-f"}
-	o.executeBuildah(pruneArgs...) // Ignore errors during cleanup
-
-	// Build pull command
-	args := []string{"pull"}
+	// 2. If not local, pull it.
+	pullArgs := []string{"pull"}
 	if o.config.Options.PublishRegistry != "" {
-		args = append(args, o.config.Options.RegistryOptsPull...)
+		pullArgs = append(pullArgs, o.config.Options.RegistryOptsPull...)
 	}
-	args = append(args, o.config.Options.Parent)
+	pullArgs = append(pullArgs, parentImage)
 
-	if _, err := o.executeBuildah(args...); err != nil {
-		return err
-	}
-
-	// Verify the image exists and is accessible
-	verifyArgs := []string{"images", "--format", "{{.Name}}:{{.Tag}}"}
-	output, err = o.executeBuildah(verifyArgs...)
-	if err != nil {
-		return fmt.Errorf("failed to verify image pull: %w", err)
+	if _, err := o.executeBuildah(pullArgs...); err != nil {
+		return err // executeBuildah will provide detailed error
 	}
 
-	images := strings.Split(strings.TrimSpace(string(output)), "\n")
-	imageFound := false
-	for _, image := range images {
-		if image == o.config.Options.Parent {
-			imageFound = true
-			break
-		}
-	}
-
-	if !imageFound {
-		return fmt.Errorf("parent image %s not found after pull", o.config.Options.Parent)
-	}
-
-	// Verify the image is accessible by trying to inspect it
-	inspectArgs := []string{"inspect", o.config.Options.Parent}
+	// 3. Verify the image exists locally after pull.
+	log.Debugf("Verifying parent image '%s' exists locally after pull", parentImage)
 	if _, err := o.executeBuildah(inspectArgs...); err != nil {
-		return fmt.Errorf("failed to inspect parent image: %w", err)
+		return fmt.Errorf("failed to inspect parent image '%s' after pulling: %w", parentImage, err)
 	}
 
-	log.Debugf("Successfully verified parent image: %s", o.config.Options.Parent)
+	log.Infof("Successfully pulled parent image: %s", parentImage)
 	return nil
 }
 
@@ -335,4 +320,99 @@ func (o *OCI) GetParentMountPoint() string {
 // GetParentContainer returns the name of the parent container
 func (o *OCI) GetParentContainer() string {
 	return o.parentContainer
+}
+
+// SaveImage saves a locally stored image to a Docker v2.2 archive tarball at the destination path.
+func (o *OCI) SaveImage(imageName, destinationPath string) error {
+	log.Debugf("Saving image '%s' to Docker archive at '%s'", imageName, destinationPath)
+	pushArgs := []string{
+		"push",
+		imageName,
+		fmt.Sprintf("docker-archive:%s", destinationPath),
+	}
+	if _, err := o.executeBuildah(pushArgs...); err != nil {
+		return fmt.Errorf("failed to save image '%s' to archive: %w", imageName, err)
+	}
+	return nil
+}
+
+// RunCommand executes a command inside the specified container.
+func (o *OCI) RunCommand(containerName, command string) error {
+	log.Debugf("Running command '%s' in container '%s'", command, containerName)
+	args := []string{
+		"run",
+		containerName,
+		"--",
+		"sh", "-c", command,
+	}
+	if _, err := o.executeBuildah(args...); err != nil {
+		return fmt.Errorf("failed to run command '%s': %w", command, err)
+	}
+	return nil
+}
+
+// RunCommandWithOutput executes a command inside the container and returns its output.
+func (o *OCI) RunCommandWithOutput(containerName, command string) ([]byte, error) {
+	log.Debugf("Running command '%s' in container '%s' and capturing output", command, containerName)
+	args := []string{
+		"run",
+		containerName,
+		"--",
+		"sh", "-c", command,
+	}
+	output, err := o.executeBuildah(args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to run command '%s' with output: %w", command, err)
+	}
+	return output, nil
+}
+
+// Stat checks for the existence of a file or directory inside a container.
+func (o *OCI) Stat(containerName, path string) error {
+	log.Debugf("Checking for existence of '%s' in container '%s'", path, containerName)
+	args := []string{"run", containerName, "--", "stat", path}
+	// We discard the output, we only care about the exit code.
+	_, err := o.executeBuildah(args...)
+	return err
+}
+
+// CopyFromContainerWithCat copies a file from the container to a destination path on the
+// host by running 'cat' inside the container and redirecting the output. This is
+// more reliable than 'buildah copy' for single files in some environments.
+func (o *OCI) CopyFromContainerWithCat(containerName, fromPath, toPath string) error {
+	log.Debugf("Copying from container '%s:%s' to host '%s' using 'cat'", containerName, fromPath, toPath)
+
+	// Create the destination file on the host.
+	hostFile, err := os.Create(toPath)
+	if err != nil {
+		return fmt.Errorf("failed to create destination file '%s' on host: %w", toPath, err)
+	}
+	defer hostFile.Close()
+
+	// Prepare the 'buildah run' command.
+	var cmd *exec.Cmd
+	var cmdStr string
+	args := []string{"run", containerName, "--", "cat", fromPath}
+
+	if os.Geteuid() == 0 {
+		cmd = exec.Command("buildah", args...)
+		cmdStr = "buildah " + strings.Join(args, " ")
+	} else {
+		cmdArgs := append([]string{"buildah"}, args...)
+		cmd = exec.Command("unshare", cmdArgs...)
+		cmdStr = "unshare " + strings.Join(cmdArgs, " ")
+	}
+
+	cmd.Stdout = hostFile // Redirect stdout directly to the host file.
+
+	// Capture stderr for better error messages.
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	log.Debugf("Executing: %s", cmdStr)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to run 'cat' in container for '%s': %w\nStderr: %s", fromPath, err, stderr.String())
+	}
+
+	return nil
 }

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"archive/tar"
+
 	"github.com/google/go-containerregistry/pkg/crane"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -23,15 +25,17 @@ import (
 
 // Image represents a container image
 type Image struct {
-	img      v1.Image
-	registry string
-	name     string
-	config   *imageconfig.Config
-	tempDirs []string // Track temporary directories for cleanup
+	img           v1.Image
+	registry      string
+	name          string
+	config        *imageconfig.Config
+	tempDirs      []string // Track temporary directories for cleanup
+	parentArchive string   // Path to temporary parent archive file, if any.
 }
 
-// NewImage creates a new image with the given registry and name
-func NewImage(registry, imgname string, cfg *imageconfig.Config) (*Image, error) {
+// NewImage creates a new image with the given registry and name.
+// If a parentImage is provided, it will be used as the base. Otherwise, an empty image is created.
+func NewImage(registry, imgname string, cfg *imageconfig.Config, parentImage v1.Image, parentArchivePath string) (*Image, error) {
 	log.Debugf("Creating new image for registry: %s, name: %s", registry, imgname)
 
 	// Sanitize registry and image name
@@ -45,20 +49,11 @@ func NewImage(registry, imgname string, cfg *imageconfig.Config) (*Image, error)
 	var img v1.Image
 	var err error
 
-	if cfg.Options.Parent != "" && cfg.Options.Parent != "scratch" {
-		log.Debugf("Using parent image: %s", cfg.Options.Parent)
-		// Pull and use parent image
-		ref, err := name.ParseReference(cfg.Options.Parent, name.Insecure)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse parent image reference: %w", err)
-		}
-		img, err = crane.Pull(ref.String(), crane.Insecure)
-		if err != nil {
-			return nil, fmt.Errorf("failed to pull parent image: %w", err)
-		}
-		log.Debugf("Successfully pulled parent image")
+	if parentImage != nil {
+		log.Debug("Using provided parent image as base.")
+		img = parentImage
 	} else {
-		log.Debug("Creating new empty image")
+		log.Debug("No parent image provided, creating new empty image.")
 		// Create empty image
 		img, err = mutate.ConfigFile(empty.Image, &v1.ConfigFile{
 			Architecture: "amd64",
@@ -71,10 +66,11 @@ func NewImage(registry, imgname string, cfg *imageconfig.Config) (*Image, error)
 	}
 
 	return &Image{
-		img:      img,
-		registry: registry,
-		name:     fullName,
-		config:   cfg,
+		img:           img,
+		registry:      registry,
+		name:          fullName,
+		config:        cfg,
+		parentArchive: parentArchivePath,
 	}, nil
 }
 
@@ -122,23 +118,36 @@ func (i *Image) AddBaseLayer(path string) error {
 	// Read OS information from /etc/os-release
 	osReleasePath := filepath.Join(path, "etc", "os-release")
 	osReleaseData, err := os.ReadFile(osReleasePath)
-	if err != nil {
+	if err == nil {
+		// If os-release exists in the new layer, parse it and set the labels.
+		log.Debug("Found /etc/os-release in new layer, parsing for OS info.")
+		osInfo := make(map[string]string)
+		for _, line := range strings.Split(string(osReleaseData), "\n") {
+			if line == "" {
+				continue
+			}
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			key := parts[0]
+			value := strings.Trim(parts[1], "\"")
+			osInfo[key] = value
+		}
+		if config.Config.Labels == nil {
+			config.Config.Labels = make(map[string]string)
+		}
+		config.Config.Labels["com.openchami.image.os.name"] = osInfo["NAME"]
+		config.Config.Labels["com.openchami.image.os.version"] = osInfo["VERSION"]
+		config.Config.Labels["com.openchami.image.os.id"] = osInfo["ID"]
+		config.Config.Labels["com.openchami.image.os.id_like"] = osInfo["ID_LIKE"]
+	} else if os.IsNotExist(err) {
+		// If it doesn't exist, we just log it. The labels from the parent (if any)
+		// are already in the config and will be preserved.
+		log.Warn("'/etc/os-release' not found in new layer. OS labels will be inherited from parent if available.")
+	} else {
+		// For any other error, we fail.
 		return fmt.Errorf("failed to read /etc/os-release: %w", err)
-	}
-
-	// Parse OS information
-	osInfo := make(map[string]string)
-	for _, line := range strings.Split(string(osReleaseData), "\n") {
-		if line == "" {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		key := parts[0]
-		value := strings.Trim(parts[1], "\"")
-		osInfo[key] = value
 	}
 
 	// Get build information
@@ -163,12 +172,6 @@ func (i *Image) AddBaseLayer(path string) error {
 		}
 		log.Debugf("Parent image has %d layers", len(parentLayers))
 	}
-
-	// Add OS information
-	config.Config.Labels["com.openchami.image.os.name"] = osInfo["NAME"]
-	config.Config.Labels["com.openchami.image.os.version"] = osInfo["VERSION"]
-	config.Config.Labels["com.openchami.image.os.id"] = osInfo["ID"]
-	config.Config.Labels["com.openchami.image.os.id_like"] = osInfo["ID_LIKE"]
 
 	// Add build information
 	config.Config.Labels["com.openchami.image.build.host"] = hostname
@@ -208,8 +211,119 @@ func (i *Image) AddBaseLayer(path string) error {
 	return nil
 }
 
+// HasLayerWithComment checks if the parent image contains a layer with the specified comment.
+func (i *Image) HasLayerWithComment(comment string) (bool, error) {
+	if i.config.Options.Parent == "" || i.config.Options.Parent == "scratch" {
+		return false, nil // No parent to search.
+	}
+
+	parentConfig, err := i.img.ConfigFile()
+	if err != nil {
+		return false, fmt.Errorf("failed to get parent image config: %w", err)
+	}
+
+	for _, h := range parentConfig.History {
+		if h.Comment == comment {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// findAndCopyLayerFromParent searches the parent image for a layer with a specific
+// comment in its history. If found, it appends the layer and its configuration
+// to the new image, returning true.
+func (i *Image) findAndCopyLayerFromParent(layerComment string) (bool, error) {
+	if i.config.Options.Parent == "" || i.config.Options.Parent == "scratch" {
+		return false, nil // No parent to search.
+	}
+
+	parentConfig, err := i.img.ConfigFile()
+	if err != nil {
+		return false, fmt.Errorf("failed to get parent image config: %w", err)
+	}
+
+	// Find the history entry matching the comment.
+	historyIndex := -1
+	for idx, h := range parentConfig.History {
+		if h.Comment == layerComment {
+			historyIndex = idx
+			break
+		}
+	}
+
+	if historyIndex == -1 {
+		log.Debugf("Did not find history comment '%s' in parent image. Will create new layer.", layerComment)
+		return false, nil
+	}
+
+	// The history list corresponds to the list of diff_ids in the config, which
+	// also corresponds to the layers.
+	parentLayers, err := i.img.Layers()
+	if err != nil {
+		return false, fmt.Errorf("failed to get parent layers: %w", err)
+	}
+
+	if historyIndex >= len(parentLayers) {
+		return false, fmt.Errorf("history index %d is out of bounds for parent layers (count: %d)", historyIndex, len(parentLayers))
+	}
+
+	log.Infof("Found existing '%s' in parent image, appending it to the new image.", layerComment)
+
+	// Get the target layer and its history entry.
+	layerToAdd := parentLayers[historyIndex]
+	historyToAdd := parentConfig.History[historyIndex]
+
+	// Get the current config of our *new* image.
+	newConfig, err := i.img.ConfigFile()
+	if err != nil {
+		return false, fmt.Errorf("failed to get new image config: %w", err)
+	}
+
+	// Copy relevant labels from the parent.
+	if newConfig.Config.Labels == nil {
+		newConfig.Config.Labels = make(map[string]string)
+	}
+	for key, value := range parentConfig.Config.Labels {
+		if strings.Contains(key, "kernel") && strings.Contains(layerComment, "Kernel") {
+			newConfig.Config.Labels[key] = value
+		}
+		if strings.Contains(key, "initrd") && strings.Contains(layerComment, "Initrd") {
+			newConfig.Config.Labels[key] = value
+		}
+	}
+
+	// Append the layer and its history to the new image.
+	i.img, err = mutate.Append(i.img, mutate.Addendum{
+		Layer:   layerToAdd,
+		History: historyToAdd,
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to append parent layer '%s': %w", layerComment, err)
+	}
+
+	// Update the config with the copied labels.
+	i.img, err = mutate.ConfigFile(i.img, newConfig)
+	if err != nil {
+		return false, fmt.Errorf("failed to update config with labels from parent layer '%s': %w", layerComment, err)
+	}
+
+	return true, nil
+}
+
 // AddKernelLayer adds a kernel layer to the image
 func (i *Image) AddKernelLayer(kernelPath, kernelVersion string) error {
+	layerComment := "Kernel Layer"
+	copied, err := i.findAndCopyLayerFromParent(layerComment)
+	if err != nil {
+		return err
+	}
+	if copied {
+		return nil // Success, layer was copied from parent.
+	}
+
+	// Fallback: If not copied, create the layer from scratch.
 	log.Debugf("Adding kernel layer from path: %s", kernelPath)
 
 	// Create a temporary directory for the layer
@@ -280,7 +394,7 @@ func (i *Image) AddKernelLayer(kernelPath, kernelVersion string) error {
 	config.History = append(config.History, v1.History{
 		Created:   v1.Time{Time: now},
 		CreatedBy: "go-image-builder",
-		Comment:   "Kernel Layer",
+		Comment:   layerComment,
 	})
 
 	// Update image config
@@ -306,6 +420,16 @@ func (i *Image) AddKernelLayer(kernelPath, kernelVersion string) error {
 
 // AddInitrdLayer adds an initrd layer to the image
 func (i *Image) AddInitrdLayer(initrdPath string) error {
+	layerComment := "Initrd Layer"
+	copied, err := i.findAndCopyLayerFromParent(layerComment)
+	if err != nil {
+		return err
+	}
+	if copied {
+		return nil // Success, layer was copied from parent.
+	}
+
+	// Fallback: If not copied, create the layer from scratch.
 	log.Debugf("Adding initrd layer from path: %s", initrdPath)
 
 	// Create a temporary directory for the layer
@@ -370,7 +494,7 @@ func (i *Image) AddInitrdLayer(initrdPath string) error {
 	config.History = append(config.History, v1.History{
 		Created:   v1.Time{Time: now},
 		CreatedBy: "go-image-builder",
-		Comment:   "Initrd Layer",
+		Comment:   layerComment,
 	})
 
 	// Update image config
@@ -479,238 +603,181 @@ func (i *Image) AddConfigLayer() error {
 	return nil
 }
 
-// Push pushes the image to the registry
+// Push pushes the image to the registry, handling multiple tags and retries.
 func (i *Image) Push() error {
 	log.Debugf("Starting image push to registry: %s", i.name)
-
-	// Configure registry options
-	log.Debug("Configuring registry options")
-	opts := []crane.Option{
-		crane.Insecure,
-	}
-
-	// Add registry options from config if specified
-	if i.config.Options.RegistryOptsPush != nil {
-		log.Debugf("Adding registry options: %v", i.config.Options.RegistryOptsPush)
-		for _, opt := range i.config.Options.RegistryOptsPush {
-			if opt == "--tls-verify=false" {
-				opts = append(opts, crane.Insecure)
-				log.Debug("Added insecure option for TLS verification")
-			}
-		}
-	}
-
-	// Get the base image reference
-	log.Debug("Parsing image reference")
 	baseRef, err := name.ParseReference(i.name, name.Insecure)
 	if err != nil {
 		return fmt.Errorf("failed to parse image reference: %w", err)
 	}
-	log.Debugf("Parsed image reference: %s", baseRef.String())
 
-	// Verify the image exists and get its manifest
-	log.Debug("Verifying image exists and getting manifest")
-	manifest, err := i.img.Manifest()
-	if err != nil {
-		return fmt.Errorf("failed to get image manifest: %w", err)
-	}
-	log.Debugf("Image manifest verified with %d layers", len(manifest.Layers))
-	for i, layer := range manifest.Layers {
-		log.Debugf("Layer %d: Size=%d, Digest=%s", i, layer.Size, layer.Digest)
+	// 1. Ensure the parent image exists in the registry first.
+	if err := i.ensureParentImage(); err != nil {
+		// Log as a warning because this might not be a fatal error if the
+		// parent already exists and is accessible.
+		log.Warnf("Could not ensure parent image exists (this may be safe to ignore): %v", err)
 	}
 
-	// Parse publish tags
+	// 2. Get the list of tags to publish.
 	tags := strings.Split(i.config.Options.PublishTags, ",")
-	if len(tags) == 0 {
-		// If no tags specified, use the default tag
-		tags = []string{baseRef.Identifier()}
+	if len(tags) == 0 || (len(tags) == 1 && tags[0] == "") {
+		tags = []string{baseRef.Identifier()} // Default to the base reference's identifier (e.g., 'latest')
 	}
 	log.Debugf("Publishing with tags: %v", tags)
 
-	// Push the image with each tag
+	// 3. Push the image with each tag.
 	for _, tag := range tags {
 		tag = strings.TrimSpace(tag)
 		if tag == "" {
 			continue
 		}
-
-		// Create tag reference
-		taggedRef, err := name.NewTag(fmt.Sprintf("%s:%s", baseRef.Context().String(), tag), name.Insecure)
-		if err != nil {
-			return fmt.Errorf("failed to create tag reference: %w", err)
-		}
-		log.Debugf("Created tag reference: %s", taggedRef.String())
-
-		// If we have a parent image, ensure it's pushed first
-		if i.config.Options.Parent != "" && i.config.Options.Parent != "scratch" {
-			parentRefStr := utils.SanitizeRegistryURL(i.config.Options.Parent)
-			log.Debugf("Ensuring parent image is pushed: %s", parentRefStr)
-			parentRef, err := name.ParseReference(parentRefStr, name.Insecure)
-			if err != nil {
-				return fmt.Errorf("failed to parse parent image reference: %w", err)
-			}
-
-			// Try to pull the parent image first to ensure it exists
-			log.Debugf("Attempting to pull parent image: %s", parentRef.String())
-			_, err = crane.Pull(parentRef.String(), opts...)
-			if err != nil {
-				log.Warnf("Failed to pull parent image (this is expected if it doesn't exist): %v", err)
-			} else {
-				log.Debugf("Successfully pulled parent image: %s", parentRef.String())
-			}
-
-			// Try to push the parent image first
-			log.Debugf("Attempting to push parent image: %s", parentRef.String())
-			if err := crane.Push(i.img, parentRef.String(), opts...); err != nil {
-				log.Warnf("Failed to push parent image (this is expected if it already exists): %v", err)
-			} else {
-				log.Debugf("Successfully pushed parent image: %s", parentRef.String())
-			}
-		}
-
-		// Push the image with retries
-		maxRetries := 3
-		var lastErr error
-		for attempt := 0; attempt < maxRetries; attempt++ {
-			if attempt > 0 {
-				log.Debugf("Retrying push (attempt %d/%d)", attempt+1, maxRetries)
-				time.Sleep(time.Second * time.Duration(attempt+1)) // Exponential backoff
-			}
-
-			log.Debugf("Pushing image with tag: %s (attempt %d)", tag, attempt+1)
-			if err := crane.Push(i.img, taggedRef.String(), opts...); err != nil {
-				lastErr = err
-				log.Warnf("Push attempt %d failed: %v", attempt+1, err)
-
-				// Check if we should retry based on the error
-				if strings.Contains(err.Error(), "BLOB_UPLOAD_UNKNOWN") {
-					log.Debug("BLOB_UPLOAD_UNKNOWN error detected, will retry")
-					continue
-				}
-
-				// For other errors, don't retry
-				break
-			}
-
-			log.Debugf("Successfully pushed image with tag: %s", tag)
-			lastErr = nil
-			break
-		}
-
-		if lastErr != nil {
-			return fmt.Errorf("failed to push image with tag %s after %d attempts: %w", tag, maxRetries, lastErr)
+		if err := i.pushTagWithRetries(baseRef, tag); err != nil {
+			return err // Return on the first failed tag push
 		}
 	}
 
+	log.Infof("Successfully pushed all tags for image: %s", i.name)
 	return nil
 }
 
-// ExtractKernel extracts the kernel from the image
-func (i *Image) ExtractKernel(destPath string) error {
-	// Find the kernel layer
-	var kernelLayer v1.Layer
-	layers, err := i.img.Layers()
-	if err != nil {
-		return fmt.Errorf("failed to get image layers: %w", err)
+// ensureParentImage checks for the parent image in the remote registry and pushes it
+// if it's not available. This is important for ensuring layers can be found.
+func (i *Image) ensureParentImage() error {
+	if i.config.Options.Parent == "" || i.config.Options.Parent == "scratch" {
+		return nil // No parent to ensure.
 	}
 
-	for _, layer := range layers {
-		config, err := i.img.ConfigFile()
-		if err != nil {
-			return fmt.Errorf("failed to get image config: %w", err)
+	log.Debugf("Ensuring parent image is pushed: %s", i.config.Options.Parent)
+	parentRefStr := utils.SanitizeRegistryURL(i.config.Options.Parent)
+	parentRef, err := name.ParseReference(parentRefStr, name.Insecure)
+	if err != nil {
+		return fmt.Errorf("failed to parse parent image reference '%s': %w", parentRefStr, err)
+	}
+
+	// Attempting to pull the parent's manifest is a lightweight way to check if it exists.
+	if _, err := crane.Manifest(parentRef.String(), crane.Insecure); err == nil {
+		log.Debugf("Parent image manifest found in registry: %s", parentRef.String())
+		return nil // Parent already exists.
+	}
+
+	// If the parent doesn't exist, we need to push it. This assumes the current
+	// image `i.img` was built from this parent and contains all its layers.
+	log.Infof("Parent image not found in registry, attempting to push it: %s", parentRef.String())
+	if err := crane.Push(i.img, parentRef.String(), crane.Insecure); err != nil {
+		return fmt.Errorf("failed to push parent image: %w", err)
+	}
+	log.Debugf("Successfully pushed parent image: %s", parentRef.String())
+	return nil
+}
+
+// pushTagWithRetries handles the logic of pushing a single tag, including retries
+// with exponential backoff for specific, recoverable errors.
+func (i *Image) pushTagWithRetries(baseRef name.Reference, tag string) error {
+	taggedRef, err := name.NewTag(fmt.Sprintf("%s:%s", baseRef.Context().String(), tag), name.Insecure)
+	if err != nil {
+		return fmt.Errorf("failed to create tag reference for tag '%s': %w", tag, err)
+	}
+
+	maxRetries := 3
+	var lastErr error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			backoff := time.Second * time.Duration(2*attempt) // Exponential backoff
+			log.Debugf("Retrying push for tag %s in %v (attempt %d/%d)", tag, backoff, attempt+1, maxRetries)
+			time.Sleep(backoff)
 		}
-		if config.Config.Labels["org.opencontainers.image.type"] == "kernel" {
-			kernelLayer = layer
+
+		log.Infof("Pushing image with tag: %s", taggedRef.String())
+		err = crane.Push(i.img, taggedRef.String(), crane.Insecure)
+		if err == nil {
+			log.Infof("Successfully pushed tag: %s", taggedRef.String())
+			return nil // Success
+		}
+
+		lastErr = err
+		log.Warnf("Push attempt %d for tag %s failed: %v", attempt+1, tag, err)
+
+		// Only retry on "BLOB_UPLOAD_UNKNOWN", which can be a transient registry issue.
+		if !strings.Contains(err.Error(), "BLOB_UPLOAD_UNKNOWN") {
+			log.Errorf("Unrecoverable error while pushing tag %s, stopping retries.", tag)
 			break
 		}
 	}
 
-	if kernelLayer == nil {
-		return fmt.Errorf("kernel layer not found in image")
-	}
+	return fmt.Errorf("failed to push tag %s after %d attempts: %w", tag, maxRetries, lastErr)
+}
 
-	// Extract the kernel
-	rc, err := kernelLayer.Uncompressed()
+// extractFile is a helper to extract a single file from the image layers.
+func (i *Image) extractFile(pathInImage, destPath string) error {
+	layers, err := i.img.Layers()
 	if err != nil {
-		return fmt.Errorf("failed to uncompress kernel layer: %w", err)
-	}
-	defer rc.Close()
-
-	// Create destination directory
-	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
-		return fmt.Errorf("failed to create destination directory: %w", err)
+		return fmt.Errorf("could not get layers: %w", err)
 	}
 
-	// Create destination file
-	dst, err := os.Create(destPath)
-	if err != nil {
-		return fmt.Errorf("failed to create destination file: %w", err)
-	}
-	defer dst.Close()
+	// Loop through layers in reverse to find the last version of the file.
+	for j := len(layers) - 1; j >= 0; j-- {
+		layer := layers[j]
+		rc, err := layer.Uncompressed()
+		if err != nil {
+			return fmt.Errorf("could not uncompress layer %d: %w", j, err)
+		}
+		defer rc.Close()
 
-	// Copy kernel to destination
-	if _, err := io.Copy(dst, rc); err != nil {
-		return fmt.Errorf("failed to copy kernel: %w", err)
+		tr := tar.NewReader(rc)
+		for {
+			header, err := tr.Next()
+			if err == io.EOF {
+				break // End of layer
+			}
+			if err != nil {
+				return fmt.Errorf("error reading layer tar %d: %w", j, err)
+			}
+
+			// The path in the tarball is relative, so we add a leading /
+			if filepath.Clean("/"+header.Name) == pathInImage {
+				if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+					return fmt.Errorf("failed to create destination directory for '%s': %w", destPath, err)
+				}
+				outFile, err := os.Create(destPath)
+				if err != nil {
+					return fmt.Errorf("failed to create destination file '%s': %w", destPath, err)
+				}
+				defer outFile.Close()
+
+				if _, err := io.Copy(outFile, tr); err != nil {
+					return fmt.Errorf("failed to copy file content for '%s': %w", pathInImage, err)
+				}
+				log.Debugf("Extracted '%s' to '%s'", pathInImage, destPath)
+				return nil // File found and extracted.
+			}
+		}
 	}
 
-	return nil
+	return fmt.Errorf("file '%s' not found in any layer of the image", pathInImage)
+}
+
+// ExtractKernel extracts the kernel from the image and saves it to the destination path.
+// The kernel is expected to be located at /boot/vmlinuz in the image.
+func (i *Image) ExtractKernel(destPath string) error {
+	return i.extractFile("/boot/vmlinuz", destPath)
 }
 
 // ExtractInitrd extracts the initrd from the image
 func (i *Image) ExtractInitrd(destPath string) error {
-	// Find the initrd layer
-	var initrdLayer v1.Layer
-	layers, err := i.img.Layers()
-	if err != nil {
-		return fmt.Errorf("failed to get image layers: %w", err)
-	}
-
-	for _, layer := range layers {
-		config, err := i.img.ConfigFile()
-		if err != nil {
-			return fmt.Errorf("failed to get image config: %w", err)
-		}
-		if config.Config.Labels["org.opencontainers.image.type"] == "initrd" {
-			initrdLayer = layer
-			break
-		}
-	}
-
-	if initrdLayer == nil {
-		return fmt.Errorf("initrd layer not found in image")
-	}
-
-	// Extract the initrd
-	rc, err := initrdLayer.Uncompressed()
-	if err != nil {
-		return fmt.Errorf("failed to uncompress initrd layer: %w", err)
-	}
-	defer rc.Close()
-
-	// Create destination directory
-	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
-		return fmt.Errorf("failed to create destination directory: %w", err)
-	}
-
-	// Create destination file
-	dst, err := os.Create(destPath)
-	if err != nil {
-		return fmt.Errorf("failed to create destination file: %w", err)
-	}
-	defer dst.Close()
-
-	// Copy initrd to destination
-	if _, err := io.Copy(dst, rc); err != nil {
-		return fmt.Errorf("failed to copy initrd: %w", err)
-	}
-
-	return nil
+	return i.extractFile("/boot/initrd.img", destPath)
 }
 
-// Cleanup removes all temporary directories
+// Cleanup removes all temporary directories and files created during the image build.
 func (i *Image) Cleanup() {
+	log.Debugf("Cleaning up temporary build artifacts")
 	for _, dir := range i.tempDirs {
+		log.Debugf("Removing temporary directory: %s", dir)
 		os.RemoveAll(dir)
 	}
-	i.tempDirs = nil
+
+	if i.parentArchive != "" {
+		log.Debugf("Removing temporary parent archive: %s", i.parentArchive)
+		os.Remove(i.parentArchive)
+	}
 }

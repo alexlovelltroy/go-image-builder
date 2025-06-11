@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"go-image-builder/pkg/oci"
+
 	log "github.com/sirupsen/logrus"
 )
 
@@ -38,12 +40,12 @@ func (d *DNF) InitRootfs(root string, config imageconfig.Config) error {
 	// Copy resolv.conf for DNS resolution
 	resolvConf := "/etc/resolv.conf"
 	if _, err := os.Stat(resolvConf); err == nil {
-		destResolvConf := filepath.Join(root, "etc", "resolv.conf")
-		if err := os.Link(resolvConf, destResolvConf); err != nil {
-			// If hard link fails, try copying
-			if err := copyFile(resolvConf, destResolvConf); err != nil {
-				return fmt.Errorf("failed to copy resolv.conf: %w", err)
-			}
+		copyInstruction := imageconfig.CopyFile{
+			Src:  resolvConf,
+			Dest: "/etc/resolv.conf",
+		}
+		if err := d.CopyFiles(root, []imageconfig.CopyFile{copyInstruction}); err != nil {
+			return fmt.Errorf("failed to copy resolv.conf: %w", err)
 		}
 	}
 
@@ -73,34 +75,6 @@ func (d *DNF) InitRootfs(root string, config imageconfig.Config) error {
 	}
 
 	return nil
-}
-
-// copyFile copies a file from src to dst
-func copyFile(src, dst string) error {
-	sourceFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer sourceFile.Close()
-
-	destFile, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer destFile.Close()
-
-	_, err = io.Copy(destFile, sourceFile)
-	if err != nil {
-		return err
-	}
-
-	// Copy file mode
-	sourceInfo, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
-
-	return os.Chmod(dst, sourceInfo.Mode())
 }
 
 func (d *DNF) AddRepos(root string, repos []imageconfig.Repository) error {
@@ -241,57 +215,15 @@ func (d *DNF) InstallPackages(root string, packages []string, groups []string) e
 	return nil
 }
 
-func (d *DNF) RunCommand(root string, cmd string) error {
-	log.Infof("Running command: %s", cmd)
-
-	// Split the command into args
-	args := []string{root, "sh", "-c", cmd}
-	execCmd := exec.Command("chroot", args...)
-
-	// Create a pipe to capture output
-	stdout, err := execCmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
-	stderr, err := execCmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stderr pipe: %w", err)
-	}
-
-	if err := execCmd.Start(); err != nil {
-		return fmt.Errorf("failed to start command: %w", err)
-	}
-
-	// Create a scanner to read output
-	scanner := bufio.NewScanner(io.MultiReader(stdout, stderr))
-	scanner.Split(bufio.ScanLines)
-
-	// Buffer to store all output for error reporting
-	var outputBuffer strings.Builder
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		// Store all output
-		outputBuffer.WriteString(line + "\n")
-
-		// Show progress for command operations
-		if strings.Contains(line, "Progress") ||
-			strings.Contains(line, "Installing") ||
-			strings.Contains(line, "Downloading") ||
-			strings.Contains(line, "Running") {
-			log.Info(line)
-		}
-	}
-
-	if err := execCmd.Wait(); err != nil {
-		return fmt.Errorf("failed to run command '%s': %w\nFull output:\n%s", cmd, err, outputBuffer.String())
-	}
-	return nil
+// RunCommand executes a command in the rootfs
+func (d *DNF) RunCommand(oci *oci.OCI, containerName, command string) error {
+	return oci.RunCommand(containerName, command)
 }
 
-func (d *DNF) Cleanup(root string) error {
+// Cleanup cleans up the rootfs after the build
+func (d *DNF) Cleanup(rootfs string) error {
 	// Clean DNF cache
-	cmd := exec.Command("dnf", "--installroot", root, "clean", "all")
+	cmd := exec.Command("dnf", "--installroot", rootfs, "clean", "all")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to clean DNF cache: %w\nOutput: %s", err, string(output))
 	}
@@ -304,7 +236,7 @@ func (d *DNF) Cleanup(root string) error {
 	}
 
 	for _, dir := range dirsToClean {
-		cmd := exec.Command("rm", "-rf", filepath.Join(root, dir, "*"))
+		cmd := exec.Command("rm", "-rf", filepath.Join(rootfs, dir, "*"))
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("failed to clean directory %s: %w", dir, err)
 		}
